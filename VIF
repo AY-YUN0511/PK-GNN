@@ -1,0 +1,34 @@
+# VIF code
+
+import pandas as pd
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# Function to calculate VIF
+def calculate_vif(X):
+    vif_data = pd.DataFrame()
+    vif_data["feature"] = X.columns
+    vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(len(X.columns))]
+    return vif_data
+
+# Initial VIF calculation
+vif_data = calculate_vif(additional_features_df)
+print(vif_data)
+
+# Function to iteratively remove features with high VIF
+def remove_high_vif_features(X, threshold=10.0):
+    while True:
+        vif_data = calculate_vif(X)
+        max_vif = vif_data['VIF'].max()
+        if max_vif > threshold:
+            feature_to_remove = vif_data.sort_values('VIF', ascending=False).iloc[0]['feature']
+            print(f"Removing feature with high VIF: {feature_to_remove} (VIF={max_vif})")
+            X = X.drop(columns=[feature_to_remove])
+        else:
+            break
+    return X, vif_data
+
+# Remove features with high VIF
+reduced_features_df, final_vif_data = remove_high_vif_features(additional_features_df)
+
+# Final VIF data
+print(final_vif_data)
