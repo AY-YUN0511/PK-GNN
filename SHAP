@@ -1,0 +1,41 @@
+# SHAP calculation
+
+def calculate_shap_values(models, data_loader, num_samples=100):
+    models = [model.eval() for model in models]
+
+    # Collect a sample batch to initialize the explainer
+    data_iter = iter(data_loader)
+    sample_data = next(data_iter)
+    background = sample_data.to(device)
+
+    # Convert the Data object to numpy array
+    background_features = background.additional_feature.cpu().numpy()
+
+    # Use SHAP KernelExplainer
+    sample_mol = smiles_to_graph(df['SMILES'].iloc[0])
+    explainer = shap.KernelExplainer(lambda x: model_predict(models, x, sample_mol), background_features)
+
+    # Compute SHAP values
+    shap_values = []
+    labels = []
+
+    for i, data in enumerate(data_loader):
+        data = data.to(device)
+        features = data.additional_feature.cpu().numpy()
+        with torch.no_grad():
+            shap_value = explainer.shap_values(features)
+            shap_values.append(shap_value)
+            labels.append(data.y.cpu().numpy())
+
+        # Stop after num_samples iterations
+        if i >= num_samples:
+            break
+
+    shap_values = np.concatenate(shap_values, axis=0)
+    labels = np.concatenate(labels, axis=0)
+
+    return shap_values, labels
+
+# Plot SHAP values
+def plot_shap_values(shap_values, feature_names, data):
+    shap.summary_plot(shap_values, data, feature_names=feature_names, plot_type="dot")
