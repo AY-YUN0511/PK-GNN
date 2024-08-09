@@ -1,0 +1,35 @@
+#Augmentation
+
+import random
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
+
+def generate_augmented_smiles(smiles, num_augments=10):
+    mol = Chem.MolFromSmiles(smiles)
+    augmented_smiles = set()
+    while len(augmented_smiles) < num_augments:
+        Chem.Kekulize(mol)
+        augmented_smiles.add(Chem.MolToSmiles(mol, doRandom=True))
+    return list(augmented_smiles)
+
+# Augment the dataset
+augmented_data = []
+for _, row in df.iterrows():
+    original_smiles = row['SMILES']
+    augmented_smiles = generate_augmented_smiles(original_smiles)
+    for sm in augmented_smiles:
+        augmented_row = row.copy()
+        augmented_row['SMILES'] = sm
+        augmented_data.append(augmented_row)
+
+# Convert augmented data to DataFrame
+augmented_df = pd.DataFrame(augmented_data)
+
+# Ensure unique indices for both DataFrames before concatenation
+augmented_df.reset_index(drop=True, inplace=True)
+df.reset_index(drop=True, inplace=True)
