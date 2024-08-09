@@ -1,0 +1,26 @@
+
+# Function to check for data leakage
+def check_data_leakage(train_df, val_df):
+    train_names = set(train_df['Name'])
+    val_names = set(val_df['Name'])
+    overlap = train_names.intersection(val_names)
+    if overlap:
+        print(f"Data leakage detected! {len(overlap)} overlapping 'Name' values between train and validation sets.")
+    else:
+        print("No data leakage detected. Train and validation sets have unique 'Name' values.")
+
+###
+def k_fold_cross_validation_with_predictions(df, target_column, k=5, num_epochs=300, patience=30, conv_type='GIN', batch_size=8):
+    group_kfold = GroupKFold(n_splits=k)
+    fold_results = []
+
+    groups = df['Name']
+
+    for fold, (train_index, val_index) in enumerate(group_kfold.split(df, groups=groups)):
+        print(f"Fold {fold + 1}")
+
+        train_df = df.iloc[train_index].copy()
+        val_df = df.iloc[val_index].copy()
+        check_data_leakage(train_df, val_df)
+        train_df['data'] = train_df.apply(lambda row: mol_to_data(row['graph'], row[target_column], row['additional_features']), axis=1)
+        val_df['data'] = val_df.apply(lambda row: mol_to_data(row['graph'], row[target_column], row['additional_features']), axis=1)
