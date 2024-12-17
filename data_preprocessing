@@ -1,0 +1,183 @@
+# data_preprocessing.py
+
+import numpy as np
+import pandas as pd
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors, DataStructs
+
+
+def extract_substructure(mol: Chem.Mol, atom_id: int, radius: int) -> Chem.Mol:
+    """
+    Extract substructure centered at atom_id with given radius.
+    
+    Parameters:
+        mol (Chem.Mol): RDKit molecule object.
+        atom_id (int): Atom index.
+        radius (int): Radius for substructure extraction.
+    
+    Returns:
+        Chem.Mol: Submolecule or None if extraction fails.
+    """
+    try:
+        if radius == 0:
+            atom = mol.GetAtomWithIdx(atom_id)
+            submol = Chem.RWMol()
+            new_atom = Chem.Atom(atom.GetAtomicNum())
+            new_atom.SetFormalCharge(atom.GetFormalCharge())
+            submol.AddAtom(new_atom)
+            return submol.GetMol()
+        else:
+            env = Chem.FindAtomEnvironmentOfRadiusN(mol, radius, atom_id)
+            if not env:
+                return None
+            submol = Chem.PathToSubmol(mol, env)
+            return submol
+    except Exception as e:
+        print(f"[DEBUG] Error extracting substructure at atom {atom_id} with radius {radius}: {e}")
+        return None
+
+
+def get_mol_descriptors(mol: Chem.Mol, missing_val: float = 0.0) -> dict:
+    """
+    Calculate molecular descriptors for a given molecule.
+    
+    Parameters:
+        mol (Chem.Mol): RDKit molecule object.
+        missing_val (float): Value to assign if descriptor calculation fails.
+    
+    Returns:
+        dict: Dictionary of descriptor names and their values.
+    """
+    descriptors = {}
+    for name, func in Descriptors._descList:
+        try:
+            value = func(mol)
+        except Exception as e:
+            print(f"Error calculating descriptor {name}: {e}")
+            value = missing_val
+        descriptors[name] = value
+    return descriptors
+
+
+def compute_and_scale_descriptors(
+    df: pd.DataFrame,
+    scaler: StandardScaler = None,
+    fit_scaler: bool = False,
+    missing_val: float = 0.0
+) -> dict:
+    """
+    Compute molecular descriptors and scale them.
+    
+    Parameters:
+        df (pd.DataFrame): DataFrame containing SMILES strings.
+        scaler (StandardScaler, optional): Scaler object. If None and fit_scaler is True, a new scaler is fitted.
+        fit_scaler (bool): Whether to fit the scaler on the computed descriptors.
+        missing_val (float): Value to assign if descriptor calculation fails.
+    
+    Returns:
+        dict: Dictionary containing scaled descriptors, indices, scaler, and descriptor names.
+    """
+    descriptor_list = []
+    valid_indices = []
+    skipped_indices = []
+    descriptor_names = None
+
+    for idx, smi in df['SMILES'].items():
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            skipped_indices.append(idx)
+            print(f"Skipping molecule at index {idx} (Invalid SMILES: {smi})")
+            continue
+
+        descriptors = get_mol_descriptors(mol, missing_val)
+        if descriptor_names is None:
+            descriptor_names = list(descriptors.keys())
+
+        descriptor_values = np.array(list(descriptors.values()), dtype=float)
+        descriptor_values = np.nan_to_num(descriptor_values, nan=missing_val, posinf=missing_val, neginf=missing_val)
+        descriptor_list.append(descriptor_values)
+        valid_indices.append(idx)
+
+    additional_features = pd.DataFrame(descriptor_list, columns=descriptor_names)
+    additional_features = additional_features.clip(lower=-1e6, upper=1e6)
+
+    if scaler is None:
+        scaler = StandardScaler()
+        scaled_descriptors = scaler.fit_transform(additional_features) if fit_scaler else scaler.transform(additional_features)
+    else:
+        scaled_descriptors = scaler.transform(additional_features)
+
+    print(f"Total skipped molecules due to invalid SMILES: {len(skipped_indices)}")
+    print(f"Skipped indices: {skipped_indices}")
+
+    return {
+        'scaled_descriptors': scaled_descriptors,
+        'valid_indices': valid_indices,
+        'skipped_indices': skipped_indices,
+        'scaler': scaler,
+        'descriptor_names': additional_features.columns
+    }
+
+
+def compute_ecfp_fingerprints(df: pd.DataFrame) -> dict:
+    """
+    Compute ECFP fingerprints and capture detailed bit information.
+    
+    Parameters:
+        df (pd.DataFrame): DataFrame containing SMILES strings.
+    
+    Returns:
+        dict: Dictionary containing ECFP features, bit info, molecules, and substructure mappings.
+    """
+    ecfp_list = []
+    bit_info_list = []
+    mol_list = []
+    valid_indices = []
+    bit_substructure_dict = {}
+
+    for idx, smi in df['SMILES'].items():
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            print(f"[DEBUG] Skipping molecule at index {idx} (Invalid SMILES: {smi})")
+            continue
+
+        try:
+            mol_list.append(mol)
+            valid_indices.append(idx)
+
+            bitInfo = {}
+            ecfp_bitvect = AllChem.GetMorganFingerprintAsBitVect(
+                mol, radius=2, nBits=2048, useFeatures=False, bitInfo=bitInfo
+            )
+            ecfp_array = np.zeros((2048,), dtype=int)
+            DataStructs.ConvertToNumpyArray(ecfp_bitvect, ecfp_array)
+            ecfp_list.append(ecfp_array)
+            bit_info_list.append(bitInfo)
+
+            for bit_idx in bitInfo:
+                substructures = []
+                for atom_id, radius in bitInfo[bit_idx]:
+                    submol = extract_substructure(mol, atom_id, radius)
+                    if submol is not None:
+                        smiles = Chem.MolToSmiles(submol, canonical=True)
+                        substructures.append(smiles)
+                if substructures:
+                    bit_substructure_dict.setdefault(bit_idx, []).extend(substructures)
+
+            if not bitInfo:
+                print(f"[DEBUG] No bits extracted for molecule at index {idx}")
+
+        except Exception as e:
+            print(f"[DEBUG] Error processing molecule at index {idx}: {e}")
+            continue
+
+    ecfp_features = np.array(ecfp_list)
+    print(f"[DEBUG] Total molecules processed: {len(mol_list)}, Shape of ECFP features: {ecfp_features.shape}")
+
+    return {
+        'ecfp_features': ecfp_features,
+        'bit_info_list': bit_info_list,
+        'mol_list': mol_list,
+        'valid_indices': valid_indices,
+        'bit_substructure_dict': bit_substructure_dict
+    }
