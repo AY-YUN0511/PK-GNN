@@ -1,0 +1,258 @@
+# scripts/run_pipeline.py
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+from src.config import SEED, N_TRIALS, SAVE_DIR, FEATURE_TYPES, SUBGROUP_OPTIONS, TARGET
+from src.data_preprocessing import set_seed, load_and_preprocess_data
+from src.features import compute_ecfp_fingerprints, compute_and_scale_descriptors, generate_ecfp_feature_names
+from src.training import tune_and_train_models
+from src.evaluation import compute_metrics
+from src.utils import save_predictions, save_metrics
+from src.plot_utils import print_metrics_table, plot_r2_comparison, plot_rmse_comparison, plot_additional_metrics
+
+def main():
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    print(f"Files will be saved to: {SAVE_DIR}")
+
+    # Load and preprocess data
+    train_df, val_df, test_df, scaler = load_and_preprocess_data(os.path.join('data', 'raw', 'processed_data.csv'))
+
+    # Assign initial subgroups
+    train_df['subgroup'] = train_df['human VDss (L/kg)'].apply(lambda x: 0 if x < 0.5 else (1 if 0.5 <= x < 1.7 else 2))
+    val_df['subgroup'] = np.nan
+    test_df['subgroup'] = np.nan
+
+    # Combine datasets for label propagation
+    combined_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    combined_df.loc[:len(train_df) - 1, 'subgroup'] = train_df['subgroup'].values
+
+    # Extract features and labels
+    X_combined = combined_df[FEATURE_TYPES]
+    y_combined = combined_df['subgroup'].fillna(-1)  # Unlabeled data as -1
+
+    # Label Propagation
+    from sklearn.semi_supervised import LabelPropagation
+    label_spread = LabelPropagation(kernel='rbf', gamma=0.9, max_iter=20, n_neighbors=20)
+    label_spread.fit(X_combined, y_combined)
+
+    combined_df['spread_subgroup'] = label_spread.predict(X_combined)
+
+    # Create binary subgroup columns
+    for i in range(label_spread.classes_.shape[0]):
+        combined_df[f'subgroup{i+1}'] = (combined_df['spread_subgroup'] == i).astype(int)
+
+    # Split back into train, val, test
+    train_len = len(train_df)
+    val_len = len(val_df)
+    test_len = len(test_df)
+
+    train_df['subgroup'] = combined_df.iloc[:train_len]['spread_subgroup'].values
+    val_df['subgroup'] = combined_df.iloc[train_len:train_len + val_len]['spread_subgroup'].values
+    test_df['subgroup'] = combined_df.iloc[train_len + val_len:train_len + val_len + test_len]['spread_subgroup'].values
+
+    for i in range(label_spread.classes_.shape[0]):
+        train_df[f'subgroup{i+1}'] = combined_df.iloc[:train_len][f'subgroup{i+1}'].values
+        val_df[f'subgroup{i+1}'] = combined_df.iloc[train_len:train_len + val_len][f'subgroup{i+1}'].values
+        test_df[f'subgroup{i+1}'] = combined_df.iloc[train_len + val_len:train_len + val_len + test_len][f'subgroup{i+1}'].values
+
+    # Compute ECFP and Descriptor features
+    train_ecfp = compute_ecfp_fingerprints(train_df)
+    val_ecfp = compute_ecfp_fingerprints(val_df)
+    test_ecfp = compute_ecfp_fingerprints(test_df)
+
+    train_desc = compute_and_scale_descriptors(train_df, fit_scaler=True)
+    val_desc = compute_and_scale_descriptors(val_df, scaler=train_desc['scaler'])
+    test_desc = compute_and_scale_descriptors(test_df, scaler=train_desc['scaler'])
+
+    # Prepare feature names
+    num_ecfp_features = train_ecfp['ecfp_features'].shape[1]
+    ecfp_feature_names = generate_ecfp_feature_names(num_ecfp_features) + ['Subgroup1', 'Subgroup2', 'Subgroup3']
+    descriptor_names = list(train_desc['descriptor_names']) + ['Subgroup1', 'Subgroup2', 'Subgroup3']
+
+    print(f"ECFP Feature Name Length: {len(ecfp_feature_names)}")
+    print(f"Descriptor Feature Name Length: {len(descriptor_names)}")
+
+    # Define target variable
+    y_train = train_df[TARGET].values
+    y_val = val_df[TARGET].values
+    y_test = test_df[TARGET].values
+
+    # Hyperparameter tuning and model training
+    best_models, models_test_predictions, models_val_predictions = tune_and_train_models(
+        train_df, val_df, test_df, train_ecfp, val_ecfp, test_ecfp, train_desc, val_desc, test_desc, target=TARGET
+    )
+
+    # Collect all predictions into a single dictionary
+    predictions_ecfp_with_subgroup = [
+        models_test_predictions["XGBoost_ECFP"]["With Subgroup"],
+        models_test_predictions["CatBoost_ECFP"]["With Subgroup"],
+        models_test_predictions["RandomForest_ECFP"]["With Subgroup"],
+        models_test_predictions["SVR_ECFP"]["With Subgroup"],
+        models_test_predictions["ElasticNet_ECFP"]["With Subgroup"],
+        models_test_predictions["MLPRegressor_ECFP"]["With Subgroup"],
+        models_test_predictions["GaussianProcessRegressor_ECFP"]["With Subgroup"]
+    ]
+
+    predictions_desc_with_subgroup = [
+        models_test_predictions["XGBoost_Descriptors"]["With Subgroup"],
+        models_test_predictions["CatBoost_Descriptors"]["With Subgroup"],
+        models_test_predictions["RandomForest_Descriptors"]["With Subgroup"],
+        models_test_predictions["SVR_Descriptors"]["With Subgroup"],
+        models_test_predictions["ElasticNet_Descriptors"]["With Subgroup"],
+        models_test_predictions["MLPRegressor_Descriptors"]["With Subgroup"],
+        models_test_predictions["GaussianProcessRegressor_Descriptors"]["With Subgroup"]
+    ]
+
+    predictions_ecfp_no_subgroup = [
+        models_test_predictions["XGBoost_ECFP"]["Without Subgroup"],
+        models_test_predictions["CatBoost_ECFP"]["Without Subgroup"],
+        models_test_predictions["RandomForest_ECFP"]["Without Subgroup"],
+        models_test_predictions["SVR_ECFP"]["Without Subgroup"],
+        models_test_predictions["ElasticNet_ECFP"]["Without Subgroup"],
+        models_test_predictions["MLPRegressor_ECFP"]["Without Subgroup"],
+        models_test_predictions["GaussianProcessRegressor_ECFP"]["Without Subgroup"]
+    ]
+
+    predictions_desc_no_subgroup = [
+        models_test_predictions["XGBoost_Descriptors"]["Without Subgroup"],
+        models_test_predictions["CatBoost_Descriptors"]["Without Subgroup"],
+        models_test_predictions["RandomForest_Descriptors"]["Without Subgroup"],
+        models_test_predictions["SVR_Descriptors"]["Without Subgroup"],
+        models_test_predictions["ElasticNet_Descriptors"]["Without Subgroup"],
+        models_test_predictions["MLPRegressor_Descriptors"]["Without Subgroup"],
+        models_test_predictions["GaussianProcessRegressor_Descriptors"]["Without Subgroup"]
+    ]
+
+    # Define Weights for Each Ensemble (equal weights)
+    weight_ecfp = 1.0 / len(predictions_ecfp_with_subgroup)
+    weight_desc = 1.0 / len(predictions_desc_with_subgroup)
+
+    # Apply Weighted Average Ensemble
+    ensemble_ecfp_with_subgroup = np.sum([weight_ecfp * preds for preds in predictions_ecfp_with_subgroup], axis=0)
+    r2_ensemble_ecfp_with_subgroup = r2_score(y_test, ensemble_ecfp_with_subgroup)
+    print(f"\nEnsemble ECFP with Subgroup R² on test set: {r2_ensemble_ecfp_with_subgroup:.4f}")
+
+    ensemble_desc_with_subgroup = np.sum([weight_desc * preds for preds in predictions_desc_with_subgroup], axis=0)
+    r2_ensemble_desc_with_subgroup = r2_score(y_test, ensemble_desc_with_subgroup)
+    print(f"Ensemble Descriptors with Subgroup R² on test set: {r2_ensemble_desc_with_subgroup:.4f}")
+
+    ensemble_ecfp_no_subgroup = np.sum([weight_ecfp * preds for preds in predictions_ecfp_no_subgroup], axis=0)
+    r2_ensemble_ecfp_no_subgroup = r2_score(y_test, ensemble_ecfp_no_subgroup)
+    print(f"Ensemble ECFP without Subgroup R² on test set: {r2_ensemble_ecfp_no_subgroup:.4f}")
+
+    ensemble_desc_no_subgroup = np.sum([weight_desc * preds for preds in predictions_desc_no_subgroup], axis=0)
+    r2_ensemble_desc_no_subgroup = r2_score(y_test, ensemble_desc_no_subgroup)
+    print(f"Ensemble Descriptors without Subgroup R² on test set: {r2_ensemble_desc_no_subgroup:.4f}")
+
+    # Define dictionary of models with their corresponding predictions
+    models = {
+        "XGBoost_ECFP": {
+            "With Subgroup": models_test_predictions["XGBoost_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["XGBoost_ECFP"]["Without Subgroup"]
+        },
+        "XGBoost_Descriptors": {
+            "With Subgroup": models_test_predictions["XGBoost_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["XGBoost_Descriptors"]["Without Subgroup"]
+        },
+        "RandomForest_ECFP": {
+              "With Subgroup": models_test_predictions["RandomForest_ECFP"]["With Subgroup"],
+              "Without Subgroup": models_test_predictions["RandomForest_ECFP"]["Without Subgroup"]
+          },
+          "RandomForest_Descriptors": {
+              "With Subgroup": models_test_predictions["RandomForest_Descriptors"]["With Subgroup"],
+              "Without Subgroup": models_test_predictions["RandomForest_Descriptors"]["Without Subgroup"]
+          },
+    
+    
+        "CatBoost_ECFP": {
+            "With Subgroup": models_test_predictions["CatBoost_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["CatBoost_ECFP"]["Without Subgroup"]
+        },
+        "CatBoost_Descriptors": {
+            "With Subgroup": models_test_predictions["CatBoost_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["CatBoost_Descriptors"]["Without Subgroup"]
+        },
+        "SVR_ECFP": {
+            "With Subgroup": models_test_predictions["SVR_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["SVR_ECFP"]["Without Subgroup"]
+        },
+        "SVR_Descriptors": {
+            "With Subgroup": models_test_predictions["SVR_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["SVR_Descriptors"]["Without Subgroup"]
+        },
+        "ElasticNet_ECFP": {
+            "With Subgroup": models_test_predictions["ElasticNet_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["ElasticNet_ECFP"]["Without Subgroup"]
+        },
+        "ElasticNet_Descriptors": {
+            "With Subgroup": models_test_predictions["ElasticNet_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["ElasticNet_Descriptors"]["Without Subgroup"]
+        },
+        "MLPRegressor_ECFP": {
+            "With Subgroup": models_test_predictions["MLPRegressor_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["MLPRegressor_ECFP"]["Without Subgroup"]
+        },
+        "MLPRegressor_Descriptors": {
+            "With Subgroup": models_test_predictions["MLPRegressor_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["MLPRegressor_Descriptors"]["Without Subgroup"]
+        },
+        "GaussianProcessRegressor_ECFP": {
+            "With Subgroup": models_test_predictions["GaussianProcessRegressor_ECFP"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["GaussianProcessRegressor_ECFP"]["Without Subgroup"]
+        },
+        "GaussianProcessRegressor_Descriptors": {
+            "With Subgroup": models_test_predictions["GaussianProcessRegressor_Descriptors"]["With Subgroup"],
+            "Without Subgroup": models_test_predictions["GaussianProcessRegressor_Descriptors"]["Without Subgroup"]
+
+        }
+    }
+
+    # Calculate metrics for all models
+    metrics_list = []
+
+    for model_name, subgroups in models.items():
+        for category, preds in subgroups.items():
+            if preds is not None:
+                metrics = compute_metrics(y_test, preds)
+                metrics['Model'] = model_name
+                metrics['Category'] = category
+                metrics_list.append(metrics)
+
+    # Create a DataFrame from the metrics list
+    metrics_df = pd.DataFrame(metrics_list)
+    metrics_df = metrics_df[["Model", "Category", "R2 (log)", "RMSE (log)", "MAE (log)", 
+                             "Accuracy_within_2x (%)", "Accuracy_within_3x (%)", "Accuracy_within_4x (%)"]]
+
+    # Display the metrics table using tabulate
+    print_metrics_table(metrics_df)
+
+    # Export the metrics table to CSV and LaTeX
+    save_metrics(metrics_df, SAVE_DIR)
+
+    # Plot R² Comparison
+    plot_r2_comparison(metrics_df, SAVE_DIR)
+
+    # Plot RMSE Comparison
+    plot_rmse_comparison(metrics_df, SAVE_DIR)
+
+    # Plot Additional Metrics
+    plot_additional_metrics(metrics_df, SAVE_DIR)
+
+    # Save the prediction dictionaries
+    predictions_paths = {
+        'models_val_predictions.pkl': models_val_predictions,
+        'models_test_predictions.pkl': models_test_predictions,
+        'y_val.pkl': y_val,
+        'y_test.pkl': y_test
+    }
+
+    for filename, data in predictions_paths.items():
+        save_path = os.path.join(SAVE_DIR, filename)
+        save_predictions(data, save_path)
+
+if __name__ == "__main__":
+    main()
